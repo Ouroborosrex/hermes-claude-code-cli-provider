@@ -59,3 +59,29 @@ claude_code_cli = ProviderProfile(
 )
 
 register_provider(claude_code_cli)
+
+
+# Best-effort: bring the local shim up if this Hermes actually uses the provider
+# and it isn't already listening (GitHub issue #1). Loaded by explicit path
+# because user plugins are imported under a synthetic module name, so a plain
+# ``import autostart`` would not resolve the sibling. Never blocks when the shim
+# is already up; disable with CLAUDE_CODE_CLI_AUTOSTART=0.
+def _autostart_shim() -> None:
+    import importlib.util
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parent / "autostart.py"
+    if not src.is_file():
+        return
+    spec = importlib.util.spec_from_file_location("_claude_code_cli_autostart", src)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.ensure_server_running()
+
+
+try:
+    _autostart_shim()
+except Exception:
+    pass

@@ -103,9 +103,12 @@ git clone https://github.com/Ouroborosrex/hermes-claude-code-cli-provider \
      `claude --model`). If the shim is running, these are listed from
      `/v1/models`; otherwise just type the name.
 
-> **Note:** the shim must be running whenever you use the provider. If Hermes
-> reports `APIConnectionError` / "Connection error" against
-> `http://127.0.0.1:8765/v1`, the shim isn't running — start it (step 1).
+> **Auto-start:** when this provider is configured (main model or any auxiliary
+> task), the plugin starts the shim for you on first use if it isn't already
+> listening — so a reboot no longer silently breaks it. Disable with
+> `CLAUDE_CODE_CLI_AUTOSTART=0` and start it manually (step 1). If you ever see
+> `APIConnectionError` against `http://127.0.0.1:8765/v1` with autostart off,
+> the shim isn't running.
 
 ## Configuration
 
@@ -123,6 +126,7 @@ The shim reads these environment variables (all optional):
 | `CLAUDE_CODE_CLI_MAX_TURNS` | `12` | `--max-turns` value. |
 | `CLAUDE_CODE_CLI_TIMEOUT` | `600` | Per-request timeout (seconds). |
 | `CLAUDE_CODE_CLI_EXTRA_ARGS` | _unset_ | Extra argv appended to every call (shlex-split). |
+| `CLAUDE_CODE_CLI_AUTOSTART` | `1` | Auto-start the shim on first use when this provider is configured (`0`/`false` to disable). |
 
 The provider profile also honors two Hermes-side env vars:
 
