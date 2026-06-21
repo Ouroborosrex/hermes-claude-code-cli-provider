@@ -1,0 +1,5 @@
+name: claude-code-cli-provider
+kind: model-provider
+version: 1.0.0
+description: Local Claude Code CLI (claude -p) exposed as an OpenAI-compatible provider via an on-device shim.
+author: bryce
