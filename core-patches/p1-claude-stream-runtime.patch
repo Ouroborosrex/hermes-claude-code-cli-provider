@@ -1,0 +1,410 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index ffefcee5e..02e8edc17 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -314,7 +314,7 @@ def init_agent(
+     agent.provider = provider_name or ""
+     agent.acp_command = acp_command or command
+     agent.acp_args = list(acp_args or args or [])
+-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
++    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server", "claude_stream"}:
+         agent.api_mode = api_mode
+     elif agent.provider == "openai-codex":
+         agent.api_mode = "codex_responses"
+diff --git a/agent/claude_stream_runtime.py b/agent/claude_stream_runtime.py
+new file mode 100644
+index 000000000..80e79a3bc
+--- /dev/null
++++ b/agent/claude_stream_runtime.py
+@@ -0,0 +1,105 @@
++"""Claude Code stream-json runtime path (P1: turn round-trip).
++
++Mirror of ``agent/codex_runtime.run_codex_app_server_turn`` for the Claude Code
++provider. When ``agent.api_mode == "claude_stream"`` (opt-in via
++``model.claude_runtime: stream_session``), ``run_conversation()`` hands the turn
++to a persistent ``ClaudeStreamSession`` instead of the chat_completions loop.
++
++P1 scope: round-trip a turn through the session and project the final assistant
++text back into Hermes' messages. **On any failure it degrades to the
++chat_completions path (the local shim) — never hard-breaks a turn.** Richer
++event mapping (P2), the Hermes-tools-over-MCP bridge (P3), and the
++permission/approval bridge (P4) are deliberately out of scope here.
++"""
++from __future__ import annotations
++
++import logging
++from typing import Any, Dict, List
++
++logger = logging.getLogger(__name__)
++
++
++def _resolve_cwd(agent) -> str:
++    cwd = getattr(agent, "session_cwd", None)
++    if cwd:
++        return str(cwd)
++    try:
++        from agent.runtime_cwd import resolve_agent_cwd
++        return str(resolve_agent_cwd())
++    except Exception:
++        import pathlib
++        return str(pathlib.Path.cwd())
++
++
++def run_claude_stream_turn(
++    agent,
++    *,
++    user_message: str,
++    original_user_message: Any,
++    messages: List[Dict[str, Any]],
++    effective_task_id: str,
++    should_review_memory: bool = False,
++) -> Dict[str, Any] | None:
++    """Run one turn through the persistent Claude Code stream-json session.
++
++    Returns the standard run_conversation() result dict on success, or **None**
++    on failure — in which case ``agent.api_mode`` has been reset to
++    ``chat_completions`` so the caller falls through to the shim path.
++    """
++    try:
++        from agent.transports.claude_stream_session import ClaudeStreamSession
++    except Exception as exc:  # import failure → fall back immediately
++        logger.warning("claude_stream unavailable (%s); falling back to chat_completions", exc)
++        agent.api_mode = "chat_completions"
++        return None
++
++    try:
++        # Lazy session: one ClaudeStreamSession per AIAgent, reused across turns.
++        if getattr(agent, "_claude_stream_session", None) is None:
++            model = (getattr(agent, "model", None) or "sonnet")
++            agent._claude_stream_session = ClaudeStreamSession(
++                cwd=_resolve_cwd(agent), model=model,
++            )
++
++        # The user message is ALREADY appended to `messages` by run_conversation()
++        # before this early-return path; do NOT append it again.
++        turn = agent._claude_stream_session.send(user_message)
++        if turn.is_error:
++            raise RuntimeError(turn.error or "claude_stream turn error")
++
++        # P1: project the final assistant text. (P2 projects tool steps too.)
++        messages.append({"role": "assistant", "content": turn.text})
++
++        # Best-effort external-memory sync, mirroring the codex path.
++        if should_review_memory and turn.text:
++            try:
++                agent._sync_external_memory_for_turn(
++                    original_user_message=original_user_message,
++                    final_response=turn.text,
++                    interrupted=False,
++                    messages=messages,
++                )
++            except Exception:
++                logger.debug("claude_stream external memory sync raised", exc_info=True)
++
++        return {
++            "final_response": turn.text,
++            "messages": messages,
++            "api_calls": 1,
++            "completed": True,
++        }
++
++    except Exception as exc:
++        logger.warning(
++            "claude_stream turn failed (%s); degrading to chat_completions (shim) for this session",
++            exc,
++        )
++        # Retire the (possibly wedged) session and fall back to the shim.
++        try:
++            if getattr(agent, "_claude_stream_session", None):
++                agent._claude_stream_session.close()
++        except Exception:
++            pass
++        agent._claude_stream_session = None
++        agent.api_mode = "chat_completions"
++        return None
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 8726ba9bd..aac5029a2 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -586,6 +586,21 @@ def run_conversation(
+             should_review_memory=_should_review_memory,
+         )
+ 
++    # Optional opt-in runtime: if api_mode == claude_stream, hand the turn to a
++    # persistent Claude Code stream-json session. On any failure it resets
++    # api_mode → chat_completions and returns None, so we fall through to the
++    # standard loop (the local shim) below. See agent/claude_stream_runtime.py.
++    if agent.api_mode == "claude_stream":
++        _claude_stream_result = agent._run_claude_stream_turn(
++            user_message=user_message,
++            original_user_message=original_user_message,
++            messages=messages,
++            effective_task_id=effective_task_id,
++            should_review_memory=_should_review_memory,
++        )
++        if _claude_stream_result is not None:
++            return _claude_stream_result
++
+     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
+         agent._checkpoint_mgr.new_turn()
+diff --git a/agent/transports/claude_stream_session.py b/agent/transports/claude_stream_session.py
+new file mode 100644
+index 000000000..331421d5c
+--- /dev/null
++++ b/agent/transports/claude_stream_session.py
+@@ -0,0 +1,167 @@
++"""Persistent Claude Code session over the stream-json protocol.
++
++One long-lived ``claude --input-format stream-json --output-format stream-json``
++process driven turn-by-turn — the Claude analog of
++``agent/transports/codex_app_server_session.py``. Context persists across turns
++because it's the same process; each ``send()`` blocks until that turn's
++``result`` event.
++
++This is the **P1** transport (issue: core integration plan): it captures the
++final text + usage and is enough for the turn round-trip. Richer event→Hermes
++mapping (streamed tool steps), the Hermes-tools-over-MCP bridge, and the
++permission/approval bridge are P2–P4 and deliberately not here.
++
++Subscription-billed (no API key), same as ``claude -p``.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import pathlib
++import shutil
++import subprocess
++import time
++from dataclasses import dataclass, field
++from typing import Optional
++
++logger = logging.getLogger(__name__)
++
++# Pre-approved in engine/stream mode so `claude` runs tools without an
++# interactive permission prompt (it can't prompt in -p mode). The
++# permission/approval bridge that replaces blanket pre-approval is P4.
++DEFAULT_STREAM_TOOLS = "Read,Write,Edit,Bash,Glob,Grep,WebFetch,WebSearch,TodoWrite"
++
++
++@dataclass
++class StreamTurn:
++    """Result of one user turn."""
++    text: str = ""
++    tool_uses: list[str] = field(default_factory=list)
++    tool_results: int = 0
++    usage: Optional[dict] = None
++    cost_usd: Optional[float] = None
++    session_id: Optional[str] = None
++    is_error: bool = False
++    error: Optional[str] = None
++
++
++class ClaudeStreamSession:
++    """One persistent `claude` stream-json process. Reused across turns."""
++
++    def __init__(
++        self,
++        cwd: Optional[str] = None,
++        model: str = "sonnet",
++        tools: Optional[str] = None,
++        permission_mode: str = "acceptEdits",
++        bin_: Optional[str] = None,
++        mcp_config: Optional[str] = None,
++    ) -> None:
++        self.bin = (
++            bin_
++            or os.environ.get("CLAUDE_CODE_CLI_BIN")
++            or shutil.which("claude")
++            or "/usr/bin/claude"
++        )
++        self.cwd = str(pathlib.Path(cwd).expanduser()) if cwd else str(pathlib.Path.cwd())
++        self.model = model or "sonnet"
++        argv = [
++            self.bin, "-p",
++            "--input-format", "stream-json",
++            "--output-format", "stream-json",
++            "--verbose",  # required for stream-json output in -p mode
++            "--model", self.model,
++            "--permission-mode", permission_mode,
++            "--allowedTools", tools or os.environ.get("CLAUDE_CODE_CLI_ENGINE_TOOLS", DEFAULT_STREAM_TOOLS),
++            "--no-session-persistence",
++        ]
++        # P3 hook: register Hermes' tools/skills as an MCP server so the agent
++        # can call them. Inert until a config path is supplied.
++        if mcp_config:
++            argv += ["--mcp-config", mcp_config, "--strict-mcp-config"]
++        self._proc = subprocess.Popen(
++            argv, cwd=self.cwd,
++            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++            text=True, encoding="utf-8", errors="replace", bufsize=1,
++        )
++        self.session_id: Optional[str] = None
++        logger.info("claude_stream: spawned session (model=%s cwd=%s)", self.model, self.cwd)
++
++    @property
++    def alive(self) -> bool:
++        return self._proc.poll() is None
++
++    def send(self, text: str, turn_timeout: float = 900.0) -> StreamTurn:
++        """Send one user turn; block until that turn's `result` event."""
++        turn = StreamTurn()
++        if self._proc.poll() is not None:
++            turn.is_error = True
++            turn.error = f"session dead (claude exited {self._proc.returncode})"
++            turn.text = f"[{turn.error}]"
++            return turn
++        try:
++            self._proc.stdin.write(  # type: ignore[union-attr]
++                json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n"
++            )
++            self._proc.stdin.flush()  # type: ignore[union-attr]
++        except (BrokenPipeError, ValueError) as exc:
++            turn.is_error = True
++            turn.error = f"session stdin closed: {exc!r}"
++            turn.text = f"[{turn.error}]"
++            return turn
++
++        deadline = time.time() + turn_timeout
++        for line in self._proc.stdout:  # type: ignore[union-attr]
++            line = line.strip()
++            if not line:
++                continue
++            try:
++                ev = json.loads(line)
++            except json.JSONDecodeError:
++                continue
++            t, sub = ev.get("type"), ev.get("subtype")
++            if t == "system" and sub == "init":
++                self.session_id = ev.get("session_id") or self.session_id
++            elif t == "assistant":
++                for b in (ev.get("message") or {}).get("content") or []:
++                    if isinstance(b, dict) and b.get("type") == "tool_use":
++                        turn.tool_uses.append(b.get("name", "?"))
++            elif t == "user":
++                for b in (ev.get("message") or {}).get("content") or []:
++                    if isinstance(b, dict) and b.get("type") == "tool_result":
++                        turn.tool_results += 1
++            elif t == "result":
++                turn.text = ev.get("result") or ""
++                turn.usage = ev.get("usage")
++                turn.cost_usd = ev.get("total_cost_usd")
++                turn.session_id = ev.get("session_id") or self.session_id
++                turn.is_error = bool(ev.get("is_error"))
++                if turn.is_error:
++                    turn.error = "claude reported is_error"
++                return turn
++            if time.time() > deadline:
++                turn.is_error = True
++                turn.error = f"turn timed out after {turn_timeout}s"
++                turn.text = f"[{turn.error}]"
++                return turn
++
++        # stdout closed without a result → process died mid-turn
++        turn.is_error = True
++        turn.error = turn.error or "session ended without a result event"
++        turn.text = turn.text or f"[{turn.error}]"
++        return turn
++
++    def close(self) -> None:
++        try:
++            if self._proc.stdin:
++                self._proc.stdin.close()
++        except Exception:
++            pass
++        try:
++            self._proc.wait(timeout=10)
++        except Exception:
++            try:
++                self._proc.kill()
++            except Exception:
++                pass
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index da0eee11d..7ca0e22fc 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -265,6 +265,10 @@ _VALID_API_MODES = {
+     # `model.openai_runtime == "codex_app_server"` AND provider in
+     # {"openai", "openai-codex"}. Default is unchanged.
+     "codex_app_server",
++    # Optional opt-in: hand the entire turn to a persistent Claude Code
++    # stream-json session (the tool loop runs inside Claude Code). Gated behind
++    # `model.claude_runtime == "stream_session"` AND a claude-code-cli provider.
++    "claude_stream",
+ }
+ 
+ 
+@@ -303,6 +307,35 @@ def _maybe_apply_codex_app_server_runtime(
+     return api_mode
+ 
+ 
++# Provider names eligible for the Claude Code stream-json runtime.
++_CLAUDE_STREAM_PROVIDERS = {
++    "claude-code-cli", "claude-cli", "cc-cli", "claude-code-local",
++}
++
++
++def _maybe_apply_claude_stream_runtime(
++    *,
++    provider: str,
++    api_mode: str,
++    model_cfg: Optional[Dict[str, Any]],
++) -> str:
++    """Optional opt-in: rewrite api_mode → "claude_stream" for the Claude Code
++    CLI provider when the user has explicitly enabled it via
++    `model.claude_runtime: stream_session` in config.yaml.
++
++    Default behavior is preserved: when the key is unset, "auto", or empty —
++    or the provider isn't claude-code-cli — this is a no-op. Returns the
++    (possibly-rewritten) api_mode."""
++    if not model_cfg:
++        return api_mode
++    if provider not in _CLAUDE_STREAM_PROVIDERS:
++        return api_mode
++    runtime = str(model_cfg.get("claude_runtime") or "").strip().lower()
++    if runtime == "stream_session":
++        return "claude_stream"
++    return api_mode
++
++
+ def _resolve_runtime_from_pool_entry(
+     *,
+     provider: str,
+@@ -431,6 +464,11 @@ def _resolve_runtime_from_pool_entry(
+     api_mode = _maybe_apply_codex_app_server_runtime(
+         provider=provider, api_mode=api_mode, model_cfg=model_cfg
+     )
++    # Optional opt-in: route Claude Code CLI turns through a stream-json session.
++    # Inert when `model.claude_runtime` is unset or the provider isn't claude-code-cli.
++    api_mode = _maybe_apply_claude_stream_runtime(
++        provider=provider, api_mode=api_mode, model_cfg=model_cfg
++    )
+ 
+     return {
+         "provider": provider,
+diff --git a/run_agent.py b/run_agent.py
+index 3d295caf2..8fdc17b2c 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -5350,6 +5350,19 @@ class AIAgent:
+         from agent.codex_runtime import run_codex_app_server_turn
+         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+ 
++    def _run_claude_stream_turn(
++        self,
++        *,
++        user_message: str,
++        original_user_message: Any,
++        messages: List[Dict[str, Any]],
++        effective_task_id: str,
++        should_review_memory: bool = False,
++    ):
++        """Forwarder — see ``agent.claude_stream_runtime.run_claude_stream_turn``."""
++        from agent.claude_stream_runtime import run_claude_stream_turn
++        return run_claude_stream_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
++
+ def main(
+     query: str = None,
+     model: str = "",
