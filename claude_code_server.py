@@ -183,8 +183,19 @@ def flatten_messages(messages: list[dict]) -> str:
     return "\n\n".join(parts).strip()
 
 
-def build_claude_argv(model: str) -> list[str]:
-    """Assemble the `claude -p` argv from config. Prompt is piped via stdin."""
+# Tools pre-approved in engine mode so `claude -p` can run them without an
+# interactive permission prompt (it can't prompt in print mode). Override with
+# CLAUDE_CODE_CLI_ENGINE_TOOLS.
+DEFAULT_ENGINE_TOOLS = "Read,Write,Edit,Bash,Glob,Grep,WebFetch,WebSearch,TodoWrite"
+
+
+def build_claude_argv(model: str, engine: bool) -> list[str]:
+    """Assemble the `claude -p` argv from config. Prompt is piped via stdin.
+
+    engine=True  → Claude Code uses its OWN tools to actually do the work
+                   (read/edit files, run bash) — "use Claude Code as an engine".
+    engine=False → no tools, single turn — a plain text model (aux tasks).
+    """
     argv = [
         resolve_claude_bin(),
         "-p",
@@ -197,18 +208,35 @@ def build_claude_argv(model: str) -> list[str]:
     if effort:
         argv += ["--effort", effort]
 
-    # Default: disable the CLI's own tool loop so it behaves as a text model
-    # (Hermes owns tools/sandboxing). Set CLAUDE_CODE_CLI_TOOLS=Read,Bash to allow.
-    tools = _env("CLAUDE_CODE_CLI_TOOLS", "")
-    argv += ["--tools", tools]
-
-    disallowed = _env("CLAUDE_CODE_CLI_DISALLOWED_TOOLS", "").strip()
-    if disallowed:
-        argv += ["--disallowedTools", disallowed]
-
-    max_turns = _env("CLAUDE_CODE_CLI_MAX_TURNS", "12").strip()
-    if max_turns:
-        argv += ["--max-turns", max_turns]
+    if engine:
+        # Let the CLI's own agentic tool loop run. Pre-approve a capable tool set
+        # so it executes autonomously instead of blocking on permission prompts.
+        tools = _env("CLAUDE_CODE_CLI_ENGINE_TOOLS", DEFAULT_ENGINE_TOOLS).strip()
+        if tools:
+            argv += ["--allowedTools", tools]
+        if _env("CLAUDE_CODE_CLI_ENGINE_PERMISSION", "").strip().lower() in {
+            "bypass", "skip", "dangerous", "yolo",
+        }:
+            argv += ["--dangerously-skip-permissions"]
+        disallowed = _env("CLAUDE_CODE_CLI_DISALLOWED_TOOLS", "").strip()
+        if disallowed:
+            argv += ["--disallowedTools", disallowed]
+        add_dir = _env("CLAUDE_CODE_CLI_ADD_DIR", "").strip()
+        if add_dir:
+            argv += ["--add-dir", *add_dir.split(os.pathsep)]
+        max_turns = _env("CLAUDE_CODE_CLI_ENGINE_MAX_TURNS", "40").strip()
+        if max_turns:
+            argv += ["--max-turns", max_turns]
+    else:
+        # Disable the CLI's own tool loop so it behaves as a pure text model
+        # (Hermes auxiliary tasks: title-gen, compression, etc.).
+        argv += ["--tools", _env("CLAUDE_CODE_CLI_TOOLS", "")]
+        disallowed = _env("CLAUDE_CODE_CLI_DISALLOWED_TOOLS", "").strip()
+        if disallowed:
+            argv += ["--disallowedTools", disallowed]
+        max_turns = _env("CLAUDE_CODE_CLI_MAX_TURNS", "12").strip()
+        if max_turns:
+            argv += ["--max-turns", max_turns]
 
     extra = _env("CLAUDE_CODE_CLI_EXTRA_ARGS", "").strip()
     if extra:
@@ -217,6 +245,13 @@ def build_claude_argv(model: str) -> list[str]:
         except ValueError:
             pass
     return argv
+
+
+def _engine_cwd() -> str:
+    """Working directory Claude Code operates in during engine mode."""
+    raw = _env("CLAUDE_CODE_CLI_CWD", "").strip()
+    cwd = pathlib.Path(raw).expanduser() if raw else pathlib.Path.home()
+    return str(cwd) if cwd.is_dir() else str(pathlib.Path.home())
 
 
 def _extract_json_object(text: str) -> dict | None:
@@ -241,18 +276,21 @@ def _extract_json_object(text: str) -> dict | None:
         return None
 
 
-def run_claude(prompt: str, model: str) -> dict:
+def run_claude(prompt: str, model: str, engine: bool = False) -> dict:
     """Invoke `claude -p` and return {text, usage, error}.
 
     `usage` is {prompt_tokens, completion_tokens, total_tokens}. On any failure
     `error` is a human-readable string and `text` carries the same message so
-    streaming clients still see something.
+    streaming clients still see something. In engine mode the CLI runs its own
+    tools in CLAUDE_CODE_CLI_CWD and may take much longer.
     """
-    argv = build_claude_argv(model)
+    argv = build_claude_argv(model, engine)
+    default_timeout = "1200" if engine else "600"
     try:
-        timeout = int(_env("CLAUDE_CODE_CLI_TIMEOUT", "600"))
+        timeout = int(_env("CLAUDE_CODE_CLI_TIMEOUT", default_timeout))
     except ValueError:
-        timeout = 600
+        timeout = int(default_timeout)
+    cwd = _engine_cwd() if engine else None
 
     try:
         proc = subprocess.run(
@@ -265,6 +303,7 @@ def run_claude(prompt: str, model: str) -> dict:
             errors="replace",
             timeout=timeout,
             env=build_subprocess_env(),
+            cwd=cwd,
             check=False,
         )
     except FileNotFoundError:
@@ -431,12 +470,31 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream"))
         include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
+        # Engine mode: let Claude Code use its own tools to do real work.
+        # "auto" (default) turns it on when the request carries tool definitions
+        # (an agentic Hermes turn); aux completions (no tools) stay text-only.
+        mode = _env("CLAUDE_CODE_CLI_ENGINE", "auto").strip().lower()
+        if mode in {"always", "on", "1", "true", "yes"}:
+            engine = True
+        elif mode in {"never", "off", "0", "false", "no"}:
+            engine = False
+        else:
+            _tools = body.get("tools")
+            engine = isinstance(_tools, list) and len(_tools) > 0
+
         prompt = flatten_messages(messages)
+        if engine:
+            prompt += (
+                "\n\nYou are operating as an autonomous coding engine with your own tools "
+                "(Read, Write, Edit, Bash, Glob, Grep, etc.) in your working directory. Use "
+                "them to actually carry out the task — read/modify files, run commands — then "
+                "report what you did. Do not ask for permission; act."
+            )
         started = time.time()
-        outcome = run_claude(prompt, model)
+        outcome = run_claude(prompt, model, engine)
         self.log_message(
-            "model=%s stream=%s %.1fs %s", model, stream, time.time() - started,
-            "error" if outcome["error"] else "ok",
+            "model=%s engine=%s stream=%s %.1fs %s", model, engine, stream,
+            time.time() - started, "error" if outcome["error"] else "ok",
         )
 
         if stream:

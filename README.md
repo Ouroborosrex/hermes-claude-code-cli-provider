@@ -36,18 +36,35 @@ automatically. The transport just sees an ordinary OpenAI-compatible endpoint at
 `http://127.0.0.1:8765/v1`; the shim turns each request into a `claude -p`
 subprocess.
 
-## ⚠️ Important limitation — advisory / text completions only
+## Engine mode — use Claude Code as the engine
 
-`claude -p` is itself a complete agent: it runs its **own** internal tool loop
-and returns final text. This provider therefore returns plain assistant text,
-**never** OpenAI-style `tool_calls`. It is a good fit for chat, Q&A, review, and
-synthesis, but it will **not** drive Hermes' native tool-calling loop. For
-agentic tool use, use the bundled **`anthropic`** provider (Claude via API key /
-Claude Code OAuth) instead.
+`claude -p` is itself a complete agent that runs its **own** tool loop. The shim
+leans into that: when a request carries tool definitions (an agentic Hermes
+turn), it runs Claude Code with its **own** tools enabled (`Read`, `Write`,
+`Edit`, `Bash`, `Glob`, `Grep`, …) so it actually does the work — reads/edits
+files, runs commands — then returns the result. Requests with no tools (Hermes
+auxiliary tasks: title generation, compression) stay text-only.
 
-By default the shim also disables the CLI's own tools (`--tools ""`) so the
-backend behaves like a pure text model and never touches your filesystem on its
-own. Set `CLAUDE_CODE_CLI_TOOLS=Read,Bash` if you want to allow that.
+This is controlled by `CLAUDE_CODE_CLI_ENGINE` (`auto` by default — engine when
+tools are present; `always`/`never` to force).
+
+**What it gets you:** a working Claude-Code-powered agent, billed to your normal
+Claude Code plan (no API/extra-usage charge).
+
+**What it still is NOT:** the shim returns Claude's **final text**, not
+OpenAI-style `tool_calls`. So Hermes sees the *result*, not step-by-step tool
+events, and it's Claude Code's own tools doing the work — not Hermes' tools. For
+Hermes-orchestrated tool-calling, use the bundled **`anthropic`** provider
+instead (note: third-party API use now draws from paid *extra usage*, not your
+plan).
+
+> ⚠️ **Engine mode executes autonomously.** It pre-approves a capable tool set
+> (incl. `Bash` and file edits) via `--allowedTools`, so it will modify files
+> and run commands without prompting, **inside `CLAUDE_CODE_CLI_CWD`** (default:
+> your home directory). For project work, set `CLAUDE_CODE_CLI_CWD` to the repo
+> and restart the shim. Restrict the toolset with `CLAUDE_CODE_CLI_ENGINE_TOOLS`
+> (e.g. `Read,Grep,Glob` for read-only), or set `CLAUDE_CODE_CLI_ENGINE=never`
+> to keep the provider text-only.
 
 ## Requirements
 
@@ -121,9 +138,15 @@ The shim reads these environment variables (all optional):
 | `CLAUDE_CODE_CLI_BIN` | autodetect | Path to the `claude` binary. |
 | `CLAUDE_CODE_CLI_MODEL` | `sonnet` | Fallback model when a request omits one. |
 | `CLAUDE_CODE_CLI_EFFORT` | `high` | `--effort` value (empty string omits it). |
-| `CLAUDE_CODE_CLI_TOOLS` | `""` | `--tools` value; empty = no CLI tools. |
-| `CLAUDE_CODE_CLI_DISALLOWED_TOOLS` | _unset_ | `--disallowedTools` value. |
-| `CLAUDE_CODE_CLI_MAX_TURNS` | `12` | `--max-turns` value. |
+| `CLAUDE_CODE_CLI_TOOLS` | `""` | Text-mode `--tools` value; empty = no CLI tools. |
+| `CLAUDE_CODE_CLI_DISALLOWED_TOOLS` | _unset_ | `--disallowedTools` value (both modes). |
+| `CLAUDE_CODE_CLI_MAX_TURNS` | `12` | Text-mode `--max-turns`. |
+| `CLAUDE_CODE_CLI_ENGINE` | `auto` | `auto` (engine when request has tools), `always`, or `never`. |
+| `CLAUDE_CODE_CLI_ENGINE_TOOLS` | `Read,Write,Edit,Bash,Glob,Grep,WebFetch,WebSearch,TodoWrite` | Tools pre-approved (`--allowedTools`) in engine mode. |
+| `CLAUDE_CODE_CLI_ENGINE_MAX_TURNS` | `40` | Engine-mode `--max-turns`. |
+| `CLAUDE_CODE_CLI_ENGINE_PERMISSION` | _unset_ | Set to `bypass` to add `--dangerously-skip-permissions`. |
+| `CLAUDE_CODE_CLI_CWD` | `$HOME` | Working directory Claude Code operates in (engine mode). |
+| `CLAUDE_CODE_CLI_ADD_DIR` | _unset_ | Extra dirs (`--add-dir`), `os.pathsep`-separated. |
 | `CLAUDE_CODE_CLI_TIMEOUT` | `600` | Per-request timeout (seconds). |
 | `CLAUDE_CODE_CLI_EXTRA_ARGS` | _unset_ | Extra argv appended to every call (shlex-split). |
 | `CLAUDE_CODE_CLI_AUTOSTART` | `1` | Auto-start the shim on first use when this provider is configured (`0`/`false` to disable). |
