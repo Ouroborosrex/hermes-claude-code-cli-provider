@@ -58,6 +58,17 @@ Hermes-orchestrated tool-calling, use the bundled **`anthropic`** provider
 instead (note: third-party API use now draws from paid *extra usage*, not your
 plan).
 
+> ⚠️ **Interactive Hermes features don't work in engine mode.** Because Claude
+> Code owns the loop and runs one autonomous pass per turn, anything that needs
+> Hermes to drive an interactive back-and-forth — **browsing/picking skills,
+> approval prompts, step-by-step Hermes tool use, multi-turn Hermes pickers** —
+> collapses to a one-shot text dump of "what Claude Code could see," with no
+> interactivity. Engine mode is for **autonomous one-shot tasks** ("read the
+> issues", "edit this file"); for interactive Hermes flows use a tool-calling
+> provider. Restoring interactivity on the Claude Code path is the core
+> integration tracked in the project epic (the `claude_stream` `api_mode` + its
+> permission/approval bridge).
+
 > ⚠️ **Engine mode executes autonomously.** It pre-approves a capable tool set
 > (incl. `Bash` and file edits) via `--allowedTools`, so it will modify files
 > and run commands without prompting, **inside `CLAUDE_CODE_CLI_CWD`** (default:
